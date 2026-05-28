@@ -223,7 +223,8 @@ static HashJoin *make_hashjoin(List *tlist,
 							   List *joinclauses, List *otherclauses,
 							   List *hashclauses,
 							   List *hashoperators, List *hashcollations,
-							   List *hashkeys,
+							   List *outer_hashkeys,
+							   List *inner_hashkeys,
 							   Plan *lefttree, Plan *righttree,
 							   JoinType jointype, bool inner_unique);
 static Hash *make_hash(Plan *lefttree,
@@ -4380,9 +4381,10 @@ create_hashjoin_plan(PlannerInfo *root,
 					 HashPath *best_path)
 {
 	HashJoin   *join_plan;
-	Hash	   *hash_plan;
 	Plan	   *outer_plan;
 	Plan	   *inner_plan;
+	Hash	   *outer_hash_plan;
+	Hash	   *inner_hash_plan;
 	List	   *tlist = build_path_tlist(root, &best_path->jpath.path);
 	List	   *joinclauses;
 	List	   *otherclauses;
@@ -4391,9 +4393,9 @@ create_hashjoin_plan(PlannerInfo *root,
 	List	   *hashcollations = NIL;
 	List	   *inner_hashkeys = NIL;
 	List	   *outer_hashkeys = NIL;
-	Oid			skewTable = InvalidOid;
-	AttrNumber	skewColumn = InvalidAttrNumber;
-	bool		skewInherit = false;
+	Oid			skewTable = InvalidOid,Outer_skewTable=InvalidOid;
+	AttrNumber	skewColumn = InvalidAttrNumber,Outer_skewColumn =InvalidAttrNumber;
+	bool		skewInherit = false,Outer_skewInherit=false;
 	ListCell   *lc;
 
 	/*
@@ -4403,11 +4405,9 @@ create_hashjoin_plan(PlannerInfo *root,
 	 * we anticipate batching, request a small tlist from the outer side so
 	 * that we don't put extra data in the outer batch files.
 	 */
-	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath,
-									 (best_path->num_batches > 1) ? CP_SMALL_TLIST : 0);
+	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath,CP_SMALL_TLIST);
 
-	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,
-									 CP_SMALL_TLIST);
+	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,CP_SMALL_TLIST);
 
 	/* Sort join qual clauses into best execution order */
 	joinclauses = order_qual_clauses(root, best_path->jpath.joinrestrictinfo);
@@ -4485,6 +4485,30 @@ create_hashjoin_plan(PlannerInfo *root,
 			}
 		}
 	}
+	
+	if (list_length(hashclauses) == 1)
+	{
+		OpExpr	   *clause = (OpExpr *) linitial(hashclauses);
+		Node	   *node;
+
+		Assert(is_opclause(clause));
+		node = (Node *) lsecond(clause->args);
+		if (IsA(node, RelabelType))
+			node = (Node *) ((RelabelType *) node)->arg;
+		if (IsA(node, Var))
+		{
+			Var		   *var = (Var *) node;
+			RangeTblEntry *rte;
+
+			rte = root->simple_rte_array[var->varno];
+			if (rte->rtekind == RTE_RELATION)
+			{
+				Outer_skewTable = rte->relid;
+				Outer_skewColumn = var->varattno;
+				Outer_skewInherit = rte->inh;
+			}
+		}
+	}
 
 	/*
 	 * Collect hash related information. The hashed expressions are
@@ -4507,18 +4531,26 @@ create_hashjoin_plan(PlannerInfo *root,
 	/*
 	 * Build the hash node and hash join node.
 	 */
-	hash_plan = make_hash(inner_plan,
+	inner_hash_plan = make_hash(inner_plan,
 						  inner_hashkeys,
 						  skewTable,
 						  skewColumn,
 						  skewInherit);
+	outer_hash_plan = make_hash(outer_plan,
+						  outer_hashkeys,
+						  Outer_skewTable,
+						  Outer_skewColumn,
+						  Outer_skewInherit);
+
 
 	/*
 	 * Set Hash node's startup & total costs equal to total cost of input
 	 * plan; this only affects EXPLAIN display not decisions.
 	 */
-	copy_plan_costsize(&hash_plan->plan, inner_plan);
-	hash_plan->plan.startup_cost = hash_plan->plan.total_cost;
+	copy_plan_costsize(&inner_hash_plan->plan, inner_plan);
+	inner_hash_plan->plan.startup_cost = inner_hash_plan->plan.total_cost;
+	copy_plan_costsize(&outer_hash_plan->plan, outer_plan);
+	outer_hash_plan->plan.startup_cost = outer_hash_plan->plan.total_cost;
 
 	/*
 	 * If parallel-aware, the executor will also need an estimate of the total
@@ -4527,8 +4559,13 @@ create_hashjoin_plan(PlannerInfo *root,
 	 */
 	if (best_path->jpath.path.parallel_aware)
 	{
-		hash_plan->plan.parallel_aware = true;
-		hash_plan->rows_total = best_path->inner_rows_total;
+		inner_hash_plan->plan.parallel_aware = true;
+		inner_hash_plan->rows_total = best_path->inner_rows_total;
+	}
+	if (best_path->jpath.path.parallel_aware)
+	{
+		outer_hash_plan->plan.parallel_aware = true;
+		outer_hash_plan->rows_total = best_path->inner_rows_total;
 	}
 
 	join_plan = make_hashjoin(tlist,
@@ -4538,8 +4575,9 @@ create_hashjoin_plan(PlannerInfo *root,
 							  hashoperators,
 							  hashcollations,
 							  outer_hashkeys,
-							  outer_plan,
-							  (Plan *) hash_plan,
+							  inner_hashkeys,
+							  (Plan *) outer_hash_plan,
+							  (Plan *) inner_hash_plan,
 							  best_path->jpath.jointype,
 							  best_path->jpath.inner_unique);
 
@@ -5581,7 +5619,8 @@ make_hashjoin(List *tlist,
 			  List *hashclauses,
 			  List *hashoperators,
 			  List *hashcollations,
-			  List *hashkeys,
+			  List *outer_hashkeys,
+			  List *inner_hashkeys,
 			  Plan *lefttree,
 			  Plan *righttree,
 			  JoinType jointype,
@@ -5589,7 +5628,6 @@ make_hashjoin(List *tlist,
 {
 	HashJoin   *node = makeNode(HashJoin);
 	Plan	   *plan = &node->join.plan;
-
 	plan->targetlist = tlist;
 	plan->qual = otherclauses;
 	plan->lefttree = lefttree;
@@ -5597,7 +5635,7 @@ make_hashjoin(List *tlist,
 	node->hashclauses = hashclauses;
 	node->hashoperators = hashoperators;
 	node->hashcollations = hashcollations;
-	node->hashkeys = hashkeys;
+        node->hashkeys= inner_hashkeys;
 	node->join.jointype = jointype;
 	node->join.inner_unique = inner_unique;
 	node->join.joinqual = joinclauses;
