@@ -91,8 +91,72 @@ static void ExecParallelHashCloseBatchAccessors(HashJoinTable hashtable);
 static TupleTableSlot *
 ExecHash(PlanState *pstate)
 {
-	elog(ERROR, "Hash node does not support ExecProcNode call convention");
-	return NULL;
+	//elog(ERROR, "Hash node does not support ExecProcNode call convention");
+	PlanState  *outerNode;
+	List	   *hashkeys;
+	HashJoinTable hashtable;
+	TupleTableSlot *slot;
+	ExprContext *econtext;
+	uint32		hashvalue;
+	HashState  *node = (HashState *) pstate;
+	if (node->ps.instrument)
+		InstrStartNode(node->ps.instrument);
+		
+	/*
+         * get state info from node
+         */
+        outerNode = outerPlanState(node);
+	    
+        /*
+         * set expression context
+         */
+        hashkeys = node->hashkeys;
+        econtext = node->ps.ps_ExprContext;
+	hashtable=node->hashtable;
+        
+        slot = ExecProcNode(outerNode);
+	if (TupIsNull(slot)){
+	     /* resize the hash table if needed (NTUP_PER_BUCKET exceeded) */
+	     if (hashtable->nbuckets != hashtable->nbuckets_optimal)
+		    ExecHashIncreaseNumBuckets(hashtable);
+
+            /* Account for the buckets in spaceUsed (reported in EXPLAIN ANALYZE) */
+	    hashtable->spaceUsed += hashtable->nbuckets * sizeof(HashJoinTuple);
+	    if (hashtable->spaceUsed > hashtable->spacePeak)
+		    hashtable->spacePeak = hashtable->spaceUsed;
+
+     	    hashtable->partialTuples = hashtable->totalTuples;
+     	    return NULL;
+	}
+	    
+	    
+	/* We have to compute the hash value */
+	econtext->ecxt_outertuple = slot;
+	if (ExecHashGetHashValue(hashtable, econtext, hashkeys,
+							 false, hashtable->keepNulls,
+							 &hashvalue))
+	{
+		int			bucketNumber;
+		bucketNumber = ExecHashGetSkewBucket(hashtable, hashvalue);
+	    	if (bucketNumber != INVALID_SKEW_BUCKET_NO)
+	      	{
+	      		/* It's a skew tuple, so put it into that hash table */
+	      		ExecHashSkewTableInsert(hashtable, slot, hashvalue,
+	      								bucketNumber);
+	      		hashtable->skewTuples += 1;
+	    	}else
+		{
+	      		/* Not subject to skew optimization, so insert normally */
+	      		ExecHashTableInsert(hashtable, slot, hashvalue);
+	      	}
+	      	hashtable->totalTuples += 1;
+	}
+	
+        /* must provide our own instrumentation support */
+	if (node->ps.instrument)
+		InstrStopNode(node->ps.instrument, node->hashtable->partialTuples);
+
+	return slot;
 }
 
 /* ----------------------------------------------------------------
@@ -393,6 +457,7 @@ ExecInitHash(Hash *node, EState *estate, int eflags)
 	Assert(node->plan.qual == NIL);
 	hashstate->hashkeys =
 		ExecInitExprList(node->hashkeys, (PlanState *) hashstate);
+	    
 
 	return hashstate;
 }
@@ -443,7 +508,7 @@ ExecHashTableCreate(HashState *state, List *hashOperators, List *hashCollations,
 	int			i;
 	ListCell   *ho;
 	ListCell   *hc;
-	MemoryContext oldcxt;
+        MemoryContext oldcxt;
 
 	/*
 	 * Get information about the size of the relation to be hashed (it's the
@@ -1931,49 +1996,74 @@ ExecHashGetBucketAndBatch(HashJoinTable hashtable,
  */
 bool
 ExecScanHashBucket(HashJoinState *hjstate,
-				   ExprContext *econtext)
+				   ExprContext *econtext,int symbol)
 {
+
 	ExprState  *hjclauses = hjstate->hashclauses;
-	HashJoinTable hashtable = hjstate->hj_HashTable;
-	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
-	uint32		hashvalue = hjstate->hj_CurHashValue;
-
-	/*
-	 * hj_CurTuple is the address of the tuple last returned from the current
-	 * bucket, or NULL if it's time to start scanning a new bucket.
-	 *
-	 * If the tuple hashed to a skew bucket then scan the skew bucket
-	 * otherwise scan the standard hashtable bucket.
-	 */
-	if (hashTuple != NULL)
-		hashTuple = hashTuple->next.unshared;
-	else if (hjstate->hj_CurSkewBucketNo != INVALID_SKEW_BUCKET_NO)
-		hashTuple = hashtable->skewBucket[hjstate->hj_CurSkewBucketNo]->tuples;
-	else
-		hashTuple = hashtable->buckets.unshared[hjstate->hj_CurBucketNo];
-
+	HashJoinTable hashtable ;
+	HashJoinTuple hashTuple ;
+	uint32		hashvalue;
+        
+	if (symbol == 0)
+        {  
+            hashtable   = hjstate->hj_InnerHashTable;
+            hashvalue   = hjstate->hj_OuterCurHashValue;
+        }
+       else
+       {
+            hashtable   = hjstate->hj_OuterHashTable;
+            hashvalue   = hjstate->hj_InnerCurHashValue;
+        }
+	if (symbol == 0 ? hjstate->hj_InnerCurTuple : hjstate->hj_OuterCurTuple)
+        {
+            hashTuple = (symbol == 0 ? hjstate->hj_InnerCurTuple : hjstate->hj_OuterCurTuple)->next.unshared;
+        }
+        else if ((symbol == 0 ? hjstate->hj_InnerCurSkewBucketNo : hjstate->hj_OuterCurSkewBucketNo)
+                 != INVALID_SKEW_BUCKET_NO)
+        {
+            hashTuple = hashtable->skewBucket[symbol == 0 ?hjstate->hj_InnerCurSkewBucketNo: hjstate->hj_OuterCurSkewBucketNo]->tuples;
+         }
+        else
+        {
+            hashTuple = hashtable->buckets.unshared[symbol == 0 ?hjstate->hj_InnerCurBucketNo : hjstate->hj_OuterCurBucketNo];
+        }
 	while (hashTuple != NULL)
 	{
 		if (hashTuple->hashvalue == hashvalue)
 		{
-			TupleTableSlot *inntuple;
+			TupleTableSlot *matchslot;
 
 			/* insert hashtable's tuple into exec slot so ExecQual sees it */
-			inntuple = ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
-											 hjstate->hj_HashTupleSlot,
-											 false);	/* do not pfree */
-			econtext->ecxt_innertuple = inntuple;
+			matchslot = ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
+                                              symbol == 0 ? hjstate->hj_InnerTupleSlot : hjstate->hj_OuterTupleSlot,
+                                              false);	/* do not pfree */
+			if (symbol == 0)
+                        {
+                            econtext->ecxt_outertuple = hjstate->hj_OuterTupleSlot;
+                            econtext->ecxt_innertuple  = matchslot;
+                        }
+                        else
+                        {
+                            econtext->ecxt_innertuple  = hjstate->hj_InnerTupleSlot;
+                            econtext->ecxt_outertuple  = matchslot;
+                         }
 
 			if (ExecQualAndReset(hjclauses, econtext))
 			{
-				hjstate->hj_CurTuple = hashTuple;
-				return true;
+				if (symbol == 0)
+                                    hjstate->hj_InnerCurTuple = hashTuple;
+                                else
+                                    hjstate->hj_OuterCurTuple = hashTuple;
+                                return true;
 			}
 		}
 
 		hashTuple = hashTuple->next.unshared;
 	}
-
+        if (symbol == 0)
+        hjstate->hj_InnerCurTuple = NULL;
+        else
+        hjstate->hj_OuterCurTuple = NULL;
 	/*
 	 * no match
 	 */
@@ -1990,6 +2080,7 @@ ExecScanHashBucket(HashJoinState *hjstate,
  * econtext->ecxt_innertuple, using hjstate->hj_HashTupleSlot as the slot
  * for the latter.
  */
+ /*
 bool
 ExecParallelScanHashBucket(HashJoinState *hjstate,
 						   ExprContext *econtext)
@@ -2002,7 +2093,7 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 	/*
 	 * hj_CurTuple is the address of the tuple last returned from the current
 	 * bucket, or NULL if it's time to start scanning a new bucket.
-	 */
+	 
 	if (hashTuple != NULL)
 		hashTuple = ExecParallelHashNextTuple(hashtable, hashTuple);
 	else
@@ -2015,10 +2106,10 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 		{
 			TupleTableSlot *inntuple;
 
-			/* insert hashtable's tuple into exec slot so ExecQual sees it */
+			/* insert hashtable's tuple into exec slot so ExecQual sees it 
 			inntuple = ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
 											 hjstate->hj_HashTupleSlot,
-											 false);	/* do not pfree */
+											 false);	/* do not pfree 
 			econtext->ecxt_innertuple = inntuple;
 
 			if (ExecQualAndReset(hjclauses, econtext))
@@ -2033,9 +2124,10 @@ ExecParallelScanHashBucket(HashJoinState *hjstate,
 
 	/*
 	 * no match
-	 */
+	 
 	return false;
 }
+*/
 
 /*
  * ExecPrepHashTableForUnmatched
@@ -2052,9 +2144,13 @@ ExecPrepHashTableForUnmatched(HashJoinState *hjstate)
 	 * hj_CurTuple: last tuple returned, or NULL to start next bucket
 	 *----------
 	 */
-	hjstate->hj_CurBucketNo = 0;
-	hjstate->hj_CurSkewBucketNo = 0;
-	hjstate->hj_CurTuple = NULL;
+	hjstate->hj_InnerCurBucketNo = 0;
+	hjstate->hj_InnerCurSkewBucketNo = 0;
+	hjstate->hj_InnerCurTuple = NULL;
+	hjstate->hj_OuterCurBucketNo = 0;
+	hjstate->hj_OuterCurSkewBucketNo = 0;
+	hjstate->hj_OuterCurTuple = NULL;
+	
 }
 
 /*
@@ -2068,6 +2164,7 @@ ExecPrepHashTableForUnmatched(HashJoinState *hjstate)
 bool
 ExecScanHashTableForUnmatched(HashJoinState *hjstate, ExprContext *econtext)
 {
+      /*
 	HashJoinTable hashtable = hjstate->hj_HashTable;
 	HashJoinTuple hashTuple = hjstate->hj_CurTuple;
 
@@ -2077,7 +2174,7 @@ ExecScanHashTableForUnmatched(HashJoinState *hjstate, ExprContext *econtext)
 		 * hj_CurTuple is the address of the tuple last returned from the
 		 * current bucket, or NULL if it's time to start scanning a new
 		 * bucket.
-		 */
+		 
 		if (hashTuple != NULL)
 			hashTuple = hashTuple->next.unshared;
 		else if (hjstate->hj_CurBucketNo < hashtable->nbuckets)
@@ -2093,7 +2190,7 @@ ExecScanHashTableForUnmatched(HashJoinState *hjstate, ExprContext *econtext)
 			hjstate->hj_CurSkewBucketNo++;
 		}
 		else
-			break;				/* finished all buckets */
+			break;				 finished all buckets 
 
 		while (hashTuple != NULL)
 		{
@@ -2101,17 +2198,17 @@ ExecScanHashTableForUnmatched(HashJoinState *hjstate, ExprContext *econtext)
 			{
 				TupleTableSlot *inntuple;
 
-				/* insert hashtable's tuple into exec slot */
+				insert hashtable's tuple into exec slot 
 				inntuple = ExecStoreMinimalTuple(HJTUPLE_MINTUPLE(hashTuple),
 												 hjstate->hj_HashTupleSlot,
-												 false);	/* do not pfree */
+												 false);	/*do not pfree
 				econtext->ecxt_innertuple = inntuple;
 
 				/*
 				 * Reset temp memory each time; although this function doesn't
 				 * do any qual eval, the caller will, so let's keep it
 				 * parallel to ExecScanHashBucket.
-				 */
+				 
 				ResetExprContext(econtext);
 
 				hjstate->hj_CurTuple = hashTuple;
@@ -2121,15 +2218,18 @@ ExecScanHashTableForUnmatched(HashJoinState *hjstate, ExprContext *econtext)
 			hashTuple = hashTuple->next.unshared;
 		}
 
-		/* allow this loop to be cancellable */
+		 allow this loop to be cancellable 
 		CHECK_FOR_INTERRUPTS();
 	}
-
-	/*
-	 * no more unmatched tuples
-	 */
+        */
+	
+	 /* no more unmatched tuples*/
+	 
 	return false;
 }
+
+
+
 
 /*
  * ExecHashTableReset
