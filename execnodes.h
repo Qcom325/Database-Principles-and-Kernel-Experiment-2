@@ -1912,26 +1912,31 @@ typedef struct MergeJoinState
 /* ----------------
  *	 HashJoinState information
  *
- *		hashclauses				original form of the hashjoin condition
- *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition
- *		hj_HashOperators		the join operators in the hashjoin condition
- *		hj_HashTable			hash table for the hashjoin
- *								(NULL if table not built yet)
- *		hj_CurHashValue			hash value for current outer tuple
- *		hj_CurBucketNo			regular bucket# for current outer tuple
- *		hj_CurSkewBucketNo		skew bucket# for current outer tuple
- *		hj_CurTuple				last inner tuple matched to current outer
+ *		hashclauses				original form of the hashjoin condition 原始的 Hash Join 等值条件列表
+ *		hj_OuterHashKeys		the outer hash keys in the hashjoin condition 外表的哈希键表达式
+ 
+                hj_InnerHashKeys
+                
+ *		hj_HashOperators		the join operators in the hashjoin condition JOIN 条件对应的哈希运算符
+ *		hj_InnerHashTable			hash table for the hashjoin 内表构建的哈希表
+ *								(NULL if table not built yet) 
+                hj_OuterHashTable
+ *		hj_CurHashValue			hash value for current outer tuple 当前外表元组的哈希值 
+ 
+ *		hj_CurBucketNo			regular bucket# for current outer tuple 当前外表元组对应的常规哈希桶号
+ *		hj_CurSkewBucketNo		skew bucket# for current outer tuple 当前外表元组对应的倾斜优化桶号
+ *		hj_CurTuple				last inner tuple matched to current outer 上一次匹配到的内表元组
  *								tuple, or NULL if starting search
  *								(hj_CurXXX variables are undefined if
  *								OuterTupleSlot is empty!)
- *		hj_OuterTupleSlot		tuple slot for outer tuples
- *		hj_HashTupleSlot		tuple slot for inner (hashed) tuples
- *		hj_NullOuterTupleSlot	prepared null tuple for right/full outer joins
+ *		hj_OuterTupleSlot		tuple slot for outer tuples 存储外表元组的槽
+ *		hj_HashTupleSlot		tuple slot for inner (hashed) tuples 存储内表（哈希表）元组的槽	
+ *		hj_NullOuterTupleSlot	prepared null tuple for right/full outer joins 
  *		hj_NullInnerTupleSlot	prepared null tuple for left/full outer joins
- *		hj_FirstOuterTupleSlot	first tuple retrieved from outer plan
- *		hj_JoinState			current state of ExecHashJoin state machine
- *		hj_MatchedOuter			true if found a join match for current outer
- *		hj_OuterNotEmpty		true if outer relation known not empty
+ *		hj_FirstOuterTupleSlot	first tuple retrieved from outer plan 从外表计划中获取的第一个元组
+ *		hj_JoinState			current state of ExecHashJoin state machine  ExecHashJoin 状态机的当前状态
+ *		hj_MatchedOuter			true if found a join match for current outer 当前外表元组是否找到匹配
+ *		hj_OuterNotEmpty		true if outer relation known not empty 	外表是否非空
  * ----------------
  */
 
@@ -1943,22 +1948,39 @@ typedef struct HashJoinState
 {
 	JoinState	js;				/* its first field is NodeTag */
 	ExprState  *hashclauses;
+	
 	List	   *hj_OuterHashKeys;	/* list of ExprState nodes */
+	List       *hj_InnerHashKeys;
+	
 	List	   *hj_HashOperators;	/* list of operator OIDs */
 	List	   *hj_Collations;
-	HashJoinTable hj_HashTable;
-	uint32		hj_CurHashValue;
-	int			hj_CurBucketNo;
-	int			hj_CurSkewBucketNo;
-	HashJoinTuple hj_CurTuple;
+	
+	HashJoinTable hj_InnerHashTable;
+	HashJoinTable hj_OuterHashTable;
+	
+	uint32		hj_OuterCurHashValue;
+	uint32		hj_InnerCurHashValue;
+	
+	int			hj_OuterCurBucketNo;
+	int			hj_OuterCurSkewBucketNo;
+	int			hj_InnerCurBucketNo;
+	int			hj_InnerCurSkewBucketNo;
+	
+	HashJoinTuple hj_InnerCurTuple;
+	HashJoinTuple hj_OuterCurTuple;
+	
 	TupleTableSlot *hj_OuterTupleSlot;
-	TupleTableSlot *hj_HashTupleSlot;
+	TupleTableSlot *hj_InnerTupleSlot;
+	
+	
 	TupleTableSlot *hj_NullOuterTupleSlot;
 	TupleTableSlot *hj_NullInnerTupleSlot;
+	
 	TupleTableSlot *hj_FirstOuterTupleSlot;
+	TupleTableSlot *hj_FirstInnerTupleSlot;
 	int			hj_JoinState;
-	bool		hj_MatchedOuter;
-	bool		hj_OuterNotEmpty;
+	bool		hj_MatchedOuter,hj_MatchedInner;
+	bool		hj_OuterNotEmpty,hj_InnerNotEmpty;
 } HashJoinState;
 
 
