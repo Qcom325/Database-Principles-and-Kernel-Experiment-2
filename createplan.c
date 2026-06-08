@@ -4403,11 +4403,9 @@ create_hashjoin_plan(PlannerInfo *root,
 	 * we anticipate batching, request a small tlist from the outer side so
 	 * that we don't put extra data in the outer batch files.
 	 */
-	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath,
-									 (best_path->num_batches > 1) ? CP_SMALL_TLIST : 0);
+	outer_plan = create_plan_recurse(root, best_path->jpath.outerjoinpath,CP_SMALL_TLIST);
 
-	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,
-									 CP_SMALL_TLIST);
+	inner_plan = create_plan_recurse(root, best_path->jpath.innerjoinpath,CP_SMALL_TLIST);
 
 	/* Sort join qual clauses into best execution order */
 	joinclauses = order_qual_clauses(root, best_path->jpath.joinrestrictinfo);
@@ -4505,7 +4503,9 @@ create_hashjoin_plan(PlannerInfo *root,
 	}
 
 	/*
-	 * Build the hash node and hash join node.
+	 * Build the hash node for inner side (traditional) and outer side
+	 * (symmetric). For SHJ, both sides need a Hash node so that each
+	 * can incrementally receive tuples and maintain its own hash table.
 	 */
 	hash_plan = make_hash(inner_plan,
 						  inner_hashkeys,
@@ -4514,11 +4514,30 @@ create_hashjoin_plan(PlannerInfo *root,
 						  skewInherit);
 
 	/*
+	 * For Symmetric Hash Join, also create a Hash node for the outer side.
+	 * This outer Hash node will be initialized but NOT pre-built;
+	 * instead, tuples are inserted one at a time by the SHJ state machine.
+	 */
+	outer_plan = make_hash(outer_plan,
+						   outer_hashkeys,
+						   InvalidOid,
+						   InvalidAttrNumber,
+						   false);
+
+	/*
 	 * Set Hash node's startup & total costs equal to total cost of input
 	 * plan; this only affects EXPLAIN display not decisions.
+	 *
+	 * For the inner hash plan, startup = total (pre-build cost model).
+	 * For the outer hash plan (SHJ), startup = child startup cost,
+	 * because the hash table is built incrementally, not upfront.
 	 */
 	copy_plan_costsize(&hash_plan->plan, inner_plan);
 	hash_plan->plan.startup_cost = hash_plan->plan.total_cost;
+	copy_plan_costsize(&((Hash *) outer_plan)->plan,
+					   ((Hash *) outer_plan)->plan.lefttree);
+	((Hash *) outer_plan)->plan.startup_cost =
+		((Hash *) outer_plan)->plan.lefttree->startup_cost;
 
 	/*
 	 * If parallel-aware, the executor will also need an estimate of the total
@@ -5589,7 +5608,6 @@ make_hashjoin(List *tlist,
 {
 	HashJoin   *node = makeNode(HashJoin);
 	Plan	   *plan = &node->join.plan;
-
 	plan->targetlist = tlist;
 	plan->qual = otherclauses;
 	plan->lefttree = lefttree;
