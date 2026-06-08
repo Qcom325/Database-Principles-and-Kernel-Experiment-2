@@ -1930,7 +1930,7 @@ typedef struct MergeJoinState
  *								(hj_CurXXX variables are undefined if
  *								OuterTupleSlot is empty!)
  *		hj_OuterTupleSlot		tuple slot for outer tuples 存储外表元组的槽
- *		hj_HashTupleSlot		tuple slot for inner (hashed) tuples 存储内表（哈希表）元组的槽	
+ *		hj_InnerMatchSlot		slot for matched inner tuples during probing 探测阶段存储匹配内表元组的槽
  *		hj_NullOuterTupleSlot	prepared null tuple for right/full outer joins 
  *		hj_NullInnerTupleSlot	prepared null tuple for left/full outer joins
  *		hj_FirstOuterTupleSlot	first tuple retrieved from outer plan 从外表计划中获取的第一个元组
@@ -1971,7 +1971,8 @@ typedef struct HashJoinState
 	
 	TupleTableSlot *hj_OuterTupleSlot;
 	TupleTableSlot *hj_InnerTupleSlot;
-	
+	TupleTableSlot *hj_InnerMatchSlot;	/* slot for matched inner tuples during probing (symbol=0) */
+	TupleTableSlot *hj_OuterMatchSlot;	/* slot for matched outer tuples during probing (symbol=1) */
 	
 	TupleTableSlot *hj_NullOuterTupleSlot;
 	TupleTableSlot *hj_NullInnerTupleSlot;
@@ -1979,8 +1980,10 @@ typedef struct HashJoinState
 	TupleTableSlot *hj_FirstOuterTupleSlot;
 	TupleTableSlot *hj_FirstInnerTupleSlot;
 	int			hj_JoinState;
-	bool		hj_MatchedOuter,hj_MatchedInner;
-	bool		hj_OuterNotEmpty,hj_InnerNotEmpty;
+		bool		hj_MatchedOuter,hj_MatchedInner;
+		bool		hj_OuterNotEmpty,hj_InnerNotEmpty;
+		bool		hj_InnerExhausted;	/* true when inner scan returned NULL */
+		bool		hj_OuterExhausted;	/* true when outer scan returned NULL */
 } HashJoinState;
 
 
